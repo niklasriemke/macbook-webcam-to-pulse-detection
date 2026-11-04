@@ -123,40 +123,72 @@ def skin_rois(face: Face, frame_shape: tuple[int, ...]) -> list[Rect]:
     return out
 
 
-def region_colors(frame: np.ndarray, rois: list[Rect]) -> np.ndarray | None:
-    """Mittlere RGB-Farbe der Hautpixel: Zeile 0 alle Regionen zusammen, dann je Region.
+class SkinSampler:
+    """Misst pro Bild die mittlere Hautfarbe je Region und über alle Regionen.
 
-    Pixel, die farblich nicht zur Haut passen (Augenbrauen, Haare, Brillengestell,
-    Schatten, Glanzlichter), werden per adaptiver Hautmaske ausgeschlossen: Die
-    typische Hautfarbe wird pro Bild als Median in YCrCb bestimmt, so dass das
-    unabhängig vom Hautton funktioniert.
+    Jede Region bekommt eine eigene adaptive Hautmaske (Median in YCrCb), die
+    Haare, Augenbrauen, Brillengestelle, Schatten und Glanzlichter ausschließt.
+    Weil die Maske pro Region arbeitet, fällt z. B. eine Wange im Schatten
+    nicht mehr heraus. Liefert eine Region kurzzeitig zu wenig Hautpixel, wird
+    ihr letzter Wert bis zu HOLD_SEC lang weiterverwendet, statt das ganze Bild
+    zu verwerfen.
     """
-    if not rois:
-        return None
-    patches = [frame[y : y + h, x : x + w].reshape(-1, 3) for x, y, w, h in rois]
-    px = np.concatenate(patches)
+
+    HOLD_SEC = 1.0
+
+    def __init__(self) -> None:
+        self._last: list[tuple[float, np.ndarray, int]] | None = None
+        self.counts: list[int] = []  # Hautpixel je Region im letzten Bild (0 = gehalten)
+
+    def reset(self) -> None:
+        self._last = None
+
+    def sample(self, frame: np.ndarray, rois: list[Rect], t: float) -> np.ndarray | None:
+        """(1 + Anzahl Regionen, 3) RGB-Werte; Zeile 0 = alle Regionen zusammen."""
+        if not rois:
+            return None
+        if self._last is not None and len(self._last) != len(rois):
+            self._last = None
+        current: list[tuple[float, np.ndarray, int]] = []
+        self.counts = []
+        for i, (x, y, w, h) in enumerate(rois):
+            px = frame[y : y + h, x : x + w].reshape(-1, 3)
+            res = _skin_mean(px)
+            if res is not None:
+                current.append((t, res[0], res[1]))
+                self.counts.append(res[1])
+            elif self._last is not None and t - self._last[i][0] <= self.HOLD_SEC:
+                current.append(self._last[i])  # kurz gehalten
+                self.counts.append(0)
+            else:
+                return None
+        self._last = current
+        means = np.array([c[1] for c in current])
+        weights = np.array([c[2] for c in current], dtype=float)
+        pooled = (means * weights[:, None]).sum(axis=0) / weights.sum()
+        return np.vstack([pooled, means])[:, ::-1].copy()  # BGR -> RGB
+
+
+def _skin_mean(px: np.ndarray) -> tuple[np.ndarray, int] | None:
+    """Mittlere BGR-Farbe der Hautpixel einer Region und deren Anzahl."""
     ycc = cv2.cvtColor(px.reshape(-1, 1, 3), cv2.COLOR_BGR2YCrCb).reshape(-1, 3).astype(np.int16)
     med = np.median(ycc, axis=0)
     ok = (
-        (np.abs(ycc[:, 1] - med[1]) <= 12)
-        & (np.abs(ycc[:, 2] - med[2]) <= 12)
-        & (ycc[:, 0] >= 0.6 * med[0])
-        & (ycc[:, 0] <= 1.5 * med[0])
+        (np.abs(ycc[:, 1] - med[1]) <= 15)
+        & (np.abs(ycc[:, 2] - med[2]) <= 15)
+        & (ycc[:, 0] >= 0.5 * med[0])
+        & (ycc[:, 0] <= 1.6 * med[0])
         & (px.max(axis=1) < 250)
-        & (px.min(axis=1) > 10)
     )
-    pxf = px.astype(float)
-    out = [pxf[ok].mean(axis=0)] if ok.sum() >= 100 else None
-    if out is None:
+    n = int(ok.sum())
+    if n < max(30, 0.1 * len(px)):
         return None
-    start = 0
-    for p in patches:
-        m = ok[start : start + len(p)]
-        if m.sum() < 30:
-            return None
-        out.append(pxf[start : start + len(p)][m].mean(axis=0))
-        start += len(p)
-    return np.array(out)[:, ::-1].copy()  # BGR -> RGB
+    return px[ok].astype(float).mean(axis=0), n
+
+
+def region_colors(frame: np.ndarray, rois: list[Rect]) -> np.ndarray | None:
+    """Wie SkinSampler.sample für ein einzelnes Bild (ohne Halten)."""
+    return SkinSampler().sample(frame, rois, 0.0)
 
 
 def mean_rgb(frame: np.ndarray, rois: list[Rect]) -> np.ndarray | None:
@@ -173,9 +205,11 @@ GREEN, YELLOW, RED, WHITE, GREY = (80, 200, 80), (60, 200, 230), (70, 70, 230), 
 
 
 def quality_color(snr_db: float) -> tuple[int, int, int]:
-    if snr_db >= 3:
-        return GREEN
+    # Schwellen aus der Whoop-Vergleichsmessung: richtige Werte lagen meist
+    # bei -3 bis +2 dB; unter -3 dB fließt eine Schätzung nicht in die Anzeige ein.
     if snr_db >= 0:
+        return GREEN
+    if snr_db >= -3:
         return YELLOW
     return RED
 
@@ -272,16 +306,16 @@ def parse_roi(s: str) -> Rect:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description="Puls über die Webcam messen (rPPG, POS-Algorithmus).")
+    p = argparse.ArgumentParser(description="Puls über die Webcam messen (rPPG).")
     p.add_argument("--camera", type=int, default=0, help="Kamera-Index (Standard: 0 = eingebaute FaceTime-Kamera)")
     p.add_argument("--video", help="Videodatei statt Kamera auswerten")
-    p.add_argument("--window", type=float, default=10.0, help="Analysefenster in Sekunden (Standard: 10)")
-    p.add_argument("--method", choices=sorted(METHODS), default="pos", help="Signalverfahren (Standard: pos)")
+    p.add_argument("--window", type=float, default=20.0, help="Analysefenster in Sekunden (Standard: 20)")
+    p.add_argument("--method", choices=sorted(METHODS), default="green", help="Signalverfahren (Standard: green)")
     p.add_argument("--roi", type=parse_roi, help="Feste Hautregion x,y,w,h statt Gesichtserkennung")
     p.add_argument("--headless", action="store_true", help="Kein Fenster, nur Textausgabe")
     p.add_argument("--csv", help="Messwerte in diese CSV-Datei schreiben")
     p.add_argument("--no-mirror", action="store_true", help="Live-Bild nicht spiegeln")
-    p.add_argument("--no-track", action="store_true", help="Kein Peak-Tracking (jedes Fenster unabhängig schätzen)")
+    p.add_argument("--track", action="store_true", help="Peak-Tracking: bei ähnlich starken Peaks den nächstgelegenen nehmen")
     p.add_argument(
         "--record",
         help="Rohdaten pro Bild (Zeit, Hautfarben je Region, Gesichtsbox) als CSV speichern – zum Nachanalysieren",
@@ -290,8 +324,9 @@ def main(argv: list[str] | None = None) -> int:
 
     cap = open_capture(args)
     tracker = None if args.roi else FaceTracker()
+    sampler = SkinSampler()
     estimator = PulseEstimator(
-        window_sec=args.window, min_sec=min(8.0, args.window), method=args.method, track=not args.no_track
+        window_sec=args.window, min_sec=min(10.0, args.window), method=args.method, track=args.track
     )
     mirror = not args.video and not args.no_mirror
     video_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -307,7 +342,7 @@ def main(argv: list[str] | None = None) -> int:
         cols = ["uhrzeit", "unix_s", "zeit_s", "bild_hell"]
         for name in ("alle", "stirn", "wange_l", "wange_r"):
             cols += [f"{name}_r", f"{name}_g", f"{name}_b"]
-        rec.writerow(cols + ["gesicht_x", "gesicht_y", "gesicht_b", "gesicht_h"])
+        rec.writerow(cols + ["gesicht_x", "gesicht_y", "gesicht_b", "gesicht_h", "px_stirn", "px_wange_l", "px_wange_r"])
         print(f"Zeichne Rohdaten auf: {args.record} (Start {datetime.now():%H:%M:%S})", flush=True)
 
     t_start = time.monotonic()
@@ -357,12 +392,13 @@ def main(argv: list[str] | None = None) -> int:
                 rois = skin_rois(face, frame.shape) if face else []
 
             # 2) Farbe messen
-            rgb = region_colors(frame, rois) if rois else None
+            rgb = sampler.sample(frame, rois, t) if rois else None
             if rec:
                 row = [*clock_cols(wall), f"{t:.4f}", f"{frame.mean():.3f}"]
                 vals = [f"{v:.4f}" for v in rgb.ravel()] if rgb is not None else []
                 row += (vals + [""] * 12)[:12]
                 row += [f"{v:.1f}" for v in face.box] if face is not None else [""] * 4
+                row += ([str(n) for n in sampler.counts] + [""] * 3)[:3] if rgb is not None else [""] * 3
                 rec.writerow(row)
             if rgb is not None:
                 estimator.push(t, rgb)
@@ -373,6 +409,7 @@ def main(argv: list[str] | None = None) -> int:
                     estimator.reset()
                     if tracker:
                         tracker.reset()
+                    sampler.reset()
                     last_face_t = None
                 result = None
                 status = "Kein Gesicht erkannt"

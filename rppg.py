@@ -5,12 +5,16 @@ sich ihre Farbe (vor allem im Grünkanal) um Bruchteile eines Prozents ändert.
 Dieses Modul nimmt die mittlere RGB-Farbe einer Hautregion pro Kamerabild
 entgegen und schätzt daraus die Herzfrequenz.
 
-Standardverfahren ist der POS-Algorithmus ("Plane-Orthogonal-to-Skin") von
-Wang, den Brinker, Stuijk & de Haan (2017), IEEE TBME 64(7). Er projiziert die
-normierten RGB-Signale auf eine Ebene, die orthogonal zum Hautton liegt, und
-unterdrückt dadurch Helligkeitsänderungen (Bewegung, Lichtflackern) deutlich
-besser als ein reines Grünkanal-Signal. Details zur hier verwendeten Variante
-stehen in `pos()`.
+Zwei Verfahren stehen zur Wahl:
+
+- `green` (Standard): der Grünkanal, in dem das Hämoglobin am stärksten
+  absorbiert. In der Vergleichsmessung gegen eine Whoop (MacBook Air, Abendlicht,
+  ruhig sitzend; siehe tests/test_real_recording.py) war er klar am genauesten,
+  weil Rot- und vor allem Blaukanal bei wenig Licht stark rauschen.
+- `pos`: POS-Algorithmus ("Plane-Orthogonal-to-Skin") von Wang, den Brinker,
+  Stuijk & de Haan (2017), IEEE TBME 64(7). Unterdrückt Helligkeitsänderungen
+  (Bewegung, Lichtflackern) besser, mischt dafür aber das Rauschen aller drei
+  Kanäle hinein. Details zur hier verwendeten Variante stehen in `pos()`.
 """
 
 from __future__ import annotations
@@ -108,6 +112,12 @@ def power_spectrum(x: np.ndarray, fs: float) -> tuple[np.ndarray, np.ndarray]:
     return f, (s / total if total > 0 else s)
 
 
+# Bild-zu-Bild-Änderung der Hautfarbe, ab der ein Sprung angenommen wird. In der
+# Whoop-Vergleichsmessung lag normales Rauschen bei max. 2,1 %, die Belichtungs-
+# automatik der MacBook-Kamera sprang um 3–8 % pro Bild.
+MAX_JUMP = 0.03
+MAX_GAP_SEC = 1.0  # längere Datenlücken unterbrechen das Signal
+
 TRACK_RATIO = 0.5  # Nebenpeaks ab diesem Anteil des Maximums kommen fürs Tracking in Frage
 
 
@@ -181,25 +191,26 @@ class PulseEstimator:
 
     def __init__(
         self,
-        window_sec: float = 10.0,
-        min_sec: float = 8.0,
+        window_sec: float = 20.0,
+        min_sec: float = 10.0,
         fs: float = 30.0,
         min_snr_db: float = -3.0,
         smoothing: int = 9,
-        method: str = "pos",
-        track: bool = True,
+        method: str = "green",
+        track: bool = False,
     ) -> None:
         if method not in METHODS:
             raise ValueError(f"Unbekannte Methode {method!r}, erlaubt: {', '.join(METHODS)}")
         self._extract = METHODS[method]
         self.window_sec = window_sec
-        self.min_sec = min_sec
+        self.min_sec = min(min_sec, 0.9 * window_sec)  # sonst wird bei min_sec >= window nie geschätzt
         self.fs = fs
         self.min_snr_db = min_snr_db
         self.track = track
         self._t: deque[float] = deque()
         self._rgb: deque[np.ndarray] = deque()
         self._history: deque[float] = deque(maxlen=smoothing)
+        self.restarts = 0  # wie oft der Puffer wegen Sprung/Lücke neu begonnen wurde
 
     def reset(self) -> None:
         self._t.clear()
@@ -217,6 +228,15 @@ class PulseEstimator:
             self.reset()  # Anzahl Regionen hat sich geändert
         if self._t and t <= self._t[-1]:
             return  # doppelte/rückwärtslaufende Zeitstempel ignorieren
+        if self._t:
+            prev = self._rgb[-1][0].sum()
+            jump = abs(c[0].sum() - prev) / prev if prev > 0 else 0.0
+            if t - self._t[-1] > MAX_GAP_SEC or jump > MAX_JUMP:
+                # Lücke oder Sprung (Belichtungsautomatik, Kopfbewegung): Puffer neu
+                # aufbauen. Der geglättete Wert (history) bleibt erhalten.
+                self._t.clear()
+                self._rgb.clear()
+                self.restarts += 1
         self._t.append(float(t))
         self._rgb.append(c)
         while self._t and self._t[-1] - self._t[0] > self.window_sec:

@@ -4,4 +4,5 @@ __pycache__/
 venv/
 .pytest_cache/
 *.csv
+!messungen/*.csv
 .DS_Store

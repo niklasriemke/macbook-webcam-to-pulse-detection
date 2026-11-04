@@ -49,20 +49,21 @@ def run(est: PulseEstimator, t, rgb):
 
 
 @pytest.mark.parametrize("bpm", [50, 65, 72, 90, 120, 150])
-def test_estimates_heart_rate_despite_flicker(bpm):
+def test_pos_estimates_heart_rate_despite_flicker(bpm):
+    # Lichtflackern im Pulsband: die Stärke von POS (der Grünkanal scheitert hier)
     t, rgb = synthetic_skin(bpm, seed=bpm)
-    result = run(PulseEstimator(window_sec=10), t, rgb)
+    result = run(PulseEstimator(window_sec=10, method="pos"), t, rgb)
     assert result is not None
     assert abs(result.bpm - bpm) < 2.0, result
     assert result.snr_db > 2
 
 
 @pytest.mark.parametrize("bpm", [55, 75, 110])
-def test_robust_to_nonproportional_channel_response(bpm):
+def test_pos_robust_to_nonproportional_channel_response(bpm):
     # Regression: Original-POS lag hier bei ~54 statt 75 BPM, weil die Reste
     # der Helligkeitsdrift das alpha-Gewicht verfälscht haben.
     t, rgb = synthetic_skin(bpm, seed=bpm, flicker=False, channel_mismatch=(-0.08, 0.11, -0.03))
-    result = run(PulseEstimator(window_sec=10), t, rgb)
+    result = run(PulseEstimator(window_sec=10, method="pos"), t, rgb)
     assert result is not None
     assert abs(result.bpm - bpm) < 2.0, result
 
@@ -113,7 +114,7 @@ def test_reset_clears_state():
     assert est.estimate() is None
 
 
-def test_region_fusion_not_worse_than_pooled_average():
+def test_pos_region_fusion_not_worse_than_pooled_average():
     # Wie im Programm: [alle Pixel, Stirn, Wange links, Wange rechts]. In den
     # meisten Fällen stört ein periodisches Artefakt mit Farbanteil (z. B.
     # wippende Haarsträhne) nur die Stirn – das kann POS nicht wegrechnen.
@@ -129,8 +130,8 @@ def test_region_fusion_not_worse_than_pooled_average():
                 cr = clean + rng.normal(0, 0.4, clean.shape)
                 pooled = (forehead + cl + cr) / 3
                 regions = np.stack([pooled, forehead, cl, cr], axis=1)
-                hits_fused += abs(run(PulseEstimator(track=False), t, regions).bpm - bpm) < 3
-                hits_pooled += abs(run(PulseEstimator(track=False), t, pooled).bpm - bpm) < 3
+                hits_fused += abs(run(PulseEstimator(method="pos"), t, regions).bpm - bpm) < 3
+                hits_pooled += abs(run(PulseEstimator(method="pos"), t, pooled).bpm - bpm) < 3
     assert hits_fused >= hits_pooled, (hits_fused, hits_pooled)
 
 
@@ -147,3 +148,36 @@ def test_tracking_prefers_peak_near_previous_estimate():
     # Ein klar dominanter neuer Peak setzt sich trotzdem durch
     spec2 = np.exp(-((freqs - 1.2) ** 2) / 0.001) * 0.3 + np.exp(-((freqs - 0.9) ** 2) / 0.001)
     assert abs(pick_peak(freqs, spec2 / spec2.sum(), 300, 30.0, prev_bpm=72.0)[0] - 54) < 1
+
+
+def test_min_duration_never_exceeds_window():
+    t, rgb = synthetic_skin(70, seconds=15, flicker=False)
+    est = PulseEstimator(window_sec=10, min_sec=10)
+    for ti, ci in zip(t, rgb):
+        est.push(ti, ci)
+    assert est.estimate() is not None
+
+
+def test_exposure_jump_restarts_buffer_but_keeps_display_value():
+    t, rgb = synthetic_skin(70, seconds=30, flicker=False)
+    rgb = rgb.copy()
+    rgb[t > 15] *= 1.4  # Belichtungsautomatik springt
+    est = PulseEstimator(window_sec=20, min_sec=10)
+    before = None
+    for ti, ci in zip(t, rgb):
+        est.push(ti, ci)
+        if before is None and ti > 14.5:
+            before = est.estimate()
+    assert est.restarts == 1
+    after = est.estimate()  # nur Daten nach dem Sprung im Puffer
+    assert est.buffered_sec < 15.5
+    assert abs(before.bpm - 70) < 2 and abs(after.bpm - 70) < 2
+
+
+def test_gap_restarts_buffer():
+    t, rgb = synthetic_skin(70, seconds=20, flicker=False)
+    keep = (t < 8) | (t > 10)  # 2 s Aussetzer
+    est = PulseEstimator()
+    for ti, ci in zip(t[keep], rgb[keep]):
+        est.push(ti, ci)
+    assert est.restarts == 1
