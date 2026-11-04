@@ -30,6 +30,8 @@ DETECT_WIDTH = 320  # Gesichtserkennung auf verkleinertem Bild (schneller)
 FACE_LOST_RESET_SEC = 1.0  # so lange darf das Gesicht fehlen, bevor neu gemessen wird
 ESTIMATE_EVERY_SEC = 0.5
 LANDMARK_SMOOTHING = 0.3  # EMA-Faktor gegen ROI-Zittern (kleiner = ruhiger)
+CAMERA_TIMEOUT_SEC = 10.0  # so lange auf Kamerabilder warten (u. a. Berechtigungsdialog)
+WINDOW_NAME = "Puls-Messung"
 
 Rect = tuple[int, int, int, int]  # x, y, w, h
 
@@ -204,20 +206,26 @@ def open_capture(args: argparse.Namespace) -> cv2.VideoCapture:
             sys.exit(f"Video konnte nicht geöffnet werden: {args.video}")
         return cap
 
+    print(f"Öffne Kamera {args.camera} ...", flush=True)
     backend = cv2.CAP_AVFOUNDATION if sys.platform == "darwin" else cv2.CAP_ANY
     cap = cv2.VideoCapture(args.camera, backend)
     if not cap.isOpened():
-        msg = f"Kamera {args.camera} konnte nicht geöffnet werden."
-        if sys.platform == "darwin":
-            msg += (
-                "\nPrüfe unter Systemeinstellungen → Datenschutz & Sicherheit → Kamera,"
-                " ob dein Terminal (bzw. VS Code/iTerm) Zugriff hat, und starte es danach neu."
-            )
-        sys.exit(msg)
+        sys.exit(f"Kamera {args.camera} konnte nicht geöffnet werden.{camera_permission_hint()}")
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
     cap.set(cv2.CAP_PROP_FPS, 30)
     return cap
+
+
+def camera_permission_hint() -> str:
+    if sys.platform != "darwin":
+        return ""
+    return (
+        "\nPrüfe unter Systemeinstellungen → Datenschutz & Sicherheit → Kamera, ob dein"
+        " Terminal (bzw. iTerm/VS Code) Zugriff hat. Nach dem Erlauben das Terminal"
+        " komplett beenden (Cmd+Q) und neu öffnen. Falls eine andere App (FaceTime,"
+        " Zoom, Browser) die Kamera gerade nutzt, diese schließen."
+    )
 
 
 def parse_roi(s: str) -> Rect:
@@ -257,12 +265,28 @@ def main(argv: list[str] | None = None) -> int:
     last_print_t = -1e9
     result: PulseResult | None = None
     frame_idx = 0
+    last_frame_wall = time.monotonic()
+    last_status_print = -1e9
+    window_shown = False
+    status = ""
 
     try:
         while True:
             ok, frame = cap.read()
-            if not ok:
-                break
+            if not ok or frame is None:
+                if args.video:
+                    break
+                # macOS liefert direkt nach dem Öffnen (oder während die
+                # Berechtigungsabfrage offen ist) oft einige leere Bilder.
+                if time.monotonic() - last_frame_wall > CAMERA_TIMEOUT_SEC:
+                    what = "keine Bilder" if frame_idx == 0 else "keine Bilder mehr"
+                    print(f"Die Kamera liefert seit {CAMERA_TIMEOUT_SEC:.0f} s {what}.{camera_permission_hint()}", flush=True)
+                    break
+                time.sleep(0.05)
+                continue
+            last_frame_wall = time.monotonic()
+            if frame_idx == 0 and not args.video:
+                print(f"Kamera liefert Bilder ({frame.shape[1]}x{frame.shape[0]}).", flush=True)
             frame_idx += 1
             if args.video:
                 t = frame_idx / video_fps
@@ -307,12 +331,26 @@ def main(argv: list[str] | None = None) -> int:
             if args.headless and result is not None and t - last_print_t >= 1.0:
                 last_print_t = t
                 print(f"t={t:6.1f}s  Puls {result.bpm:5.1f} BPM  (Fenster: {result.raw_bpm:5.1f}, SNR {result.snr_db:+5.1f} dB)", flush=True)
+            elif result is None and t - last_status_print >= 2.0:
+                last_status_print = t
+                print(f"t={t:6.1f}s  {status} ({estimator.buffered_sec:.0f}/{estimator.min_sec:.0f} s)", flush=True)
 
             # 4) Anzeigen
             if not args.headless:
                 progress = estimator.buffered_sec / estimator.min_sec
                 draw_overlay(frame, rois, result, status, progress)
-                cv2.imshow("Puls-Messung", frame)
+                cv2.imshow(WINDOW_NAME, frame)
+                if not window_shown:
+                    window_shown = True
+                    try:  # auf macOS öffnet sich das Fenster sonst gern hinter dem Terminal
+                        cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_TOPMOST, 1)
+                    except cv2.error:
+                        pass
+                    print(
+                        f"Fenster '{WINDOW_NAME}' ist offen. Nicht zu sehen? Im Dock auf das"
+                        " Python-Symbol klicken. Beenden mit q im Fenster oder Ctrl+C hier.",
+                        flush=True,
+                    )
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), 27):
                     break
