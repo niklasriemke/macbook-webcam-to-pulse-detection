@@ -111,3 +111,39 @@ def test_reset_clears_state():
     est.reset()
     assert est.buffered_sec == 0
     assert est.estimate() is None
+
+
+def test_region_fusion_not_worse_than_pooled_average():
+    # Wie im Programm: [alle Pixel, Stirn, Wange links, Wange rechts]. In den
+    # meisten Fällen stört ein periodisches Artefakt mit Farbanteil (z. B.
+    # wippende Haarsträhne) nur die Stirn – das kann POS nicht wegrechnen.
+    hits_fused = hits_pooled = 0
+    for seed in range(3):
+        rng = np.random.default_rng(seed)
+        for bpm in (58, 85):
+            t, clean = synthetic_skin(bpm, seconds=12, seed=seed * 10 + bpm, flicker=False)
+            for d in ([-0.6, 0.2, 0.9], [0.5, -0.8, 0.2], [1.0, 0.3, -0.5]):
+                art = 0.004 * np.sin(2 * np.pi * rng.uniform(0.9, 2.5) * t)
+                forehead = clean * (1 + art[:, None] * np.array(d))
+                cl = clean + rng.normal(0, 0.4, clean.shape)
+                cr = clean + rng.normal(0, 0.4, clean.shape)
+                pooled = (forehead + cl + cr) / 3
+                regions = np.stack([pooled, forehead, cl, cr], axis=1)
+                hits_fused += abs(run(PulseEstimator(track=False), t, regions).bpm - bpm) < 3
+                hits_pooled += abs(run(PulseEstimator(track=False), t, pooled).bpm - bpm) < 3
+    assert hits_fused >= hits_pooled, (hits_fused, hits_pooled)
+
+
+def test_tracking_prefers_peak_near_previous_estimate():
+    from rppg import pick_peak
+
+    freqs = np.linspace(0.7, 3.5, 500)
+    spec = np.exp(-((freqs - 1.2) ** 2) / 0.001) * 0.8 + np.exp(-((freqs - 0.9) ** 2) / 0.001)
+    spec /= spec.sum()
+    free, _ = pick_peak(freqs, spec, 300, 30.0)
+    tracked, _ = pick_peak(freqs, spec, 300, 30.0, prev_bpm=72.0)
+    assert abs(free - 54) < 1  # stärkster Peak (Artefakt bei 0,9 Hz)
+    assert abs(tracked - 72) < 1  # fast gleich starker Peak beim bisherigen Wert
+    # Ein klar dominanter neuer Peak setzt sich trotzdem durch
+    spec2 = np.exp(-((freqs - 1.2) ** 2) / 0.001) * 0.3 + np.exp(-((freqs - 0.9) ** 2) / 0.001)
+    assert abs(pick_peak(freqs, spec2 / spec2.sum(), 300, 30.0, prev_bpm=72.0)[0] - 54) < 1

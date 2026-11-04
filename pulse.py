@@ -18,6 +18,7 @@ import csv
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -26,7 +27,7 @@ import numpy as np
 from rppg import METHODS, PulseEstimator, PulseResult
 
 MODEL_PATH = Path(__file__).resolve().parent / "models" / "face_detection_yunet_2023mar.onnx"
-DETECT_WIDTH = 320  # Gesichtserkennung auf verkleinertem Bild (schneller)
+DETECT_WIDTH = 480  # Gesichtserkennung auf verkleinertem Bild (schneller)
 FACE_LOST_RESET_SEC = 1.0  # so lange darf das Gesicht fehlen, bevor neu gemessen wird
 ESTIMATE_EVERY_SEC = 0.5
 LANDMARK_SMOOTHING = 0.3  # EMA-Faktor gegen ROI-Zittern (kleiner = ruhiger)
@@ -100,41 +101,68 @@ def skin_rois(face: Face, frame_shape: tuple[int, ...]) -> list[Rect]:
     if d < 8:
         return []
     mouth_y = (face.mouth_a[1] + face.mouth_b[1]) / 2
-    cheek_bottom = (face.nose[1] + mouth_y) / 2
 
     rois = [
-        # Stirn
-        (eye_mid[0] - 0.65 * d, eye_mid[1] - 1.0 * d, 1.3 * d, 0.55 * d),
+        # Stirn: oberhalb der Augenbrauen (die liegen ca. 0,4 d über den Augen)
+        (eye_mid[0] - 0.75 * d, eye_mid[1] - 1.15 * d, 1.5 * d, 0.6 * d),
     ]
     for eye, outward in ((left_eye, -1), (right_eye, 1)):
-        top = eye[1] + 0.35 * d
-        rois.append((eye[0] - 0.28 * d + outward * 0.05 * d, top, 0.56 * d, max(cheek_bottom - top, 0.2 * d)))
+        # Wange: unter dem Auge bis kurz über Mundhöhe, leicht nach außen versetzt
+        top = eye[1] + 0.4 * d
+        bottom = max(mouth_y - 0.1 * d, top + 0.3 * d)
+        rois.append((eye[0] - 0.35 * d + outward * 0.1 * d, top, 0.7 * d, bottom - top))
 
     H, W = frame_shape[:2]
     out: list[Rect] = []
     for x, y, w, h in rois:
         x0, y0 = int(max(0, x)), int(max(0, y))
         x1, y1 = int(min(W, x + w)), int(min(H, y + h))
-        if x1 - x0 >= 4 and y1 - y0 >= 4:
-            out.append((x0, y0, x1 - x0, y1 - y0))
+        if x1 - x0 < 6 or y1 - y0 < 6:
+            return []  # alle drei Regionen oder keine – sonst ändert sich die Signalanzahl
+        out.append((x0, y0, x1 - x0, y1 - y0))
     return out
 
 
-def mean_rgb(frame: np.ndarray, rois: list[Rect]) -> np.ndarray | None:
-    """Mittlere RGB-Farbe aller Pixel in den Regionen.
+def region_colors(frame: np.ndarray, rois: list[Rect]) -> np.ndarray | None:
+    """Mittlere RGB-Farbe der Hautpixel: Zeile 0 alle Regionen zusammen, dann je Region.
 
-    Sehr dunkle und überbelichtete Pixel werden ignoriert, da sie keine
-    Farbinformation tragen (Schatten, Glanzlichter).
+    Pixel, die farblich nicht zur Haut passen (Augenbrauen, Haare, Brillengestell,
+    Schatten, Glanzlichter), werden per adaptiver Hautmaske ausgeschlossen: Die
+    typische Hautfarbe wird pro Bild als Median in YCrCb bestimmt, so dass das
+    unabhängig vom Hautton funktioniert.
     """
-    pixels = [frame[y : y + h, x : x + w].reshape(-1, 3) for x, y, w, h in rois]
-    if not pixels:
+    if not rois:
         return None
-    px = np.concatenate(pixels).astype(float)
-    ok = (px.max(axis=1) < 250) & (px.min(axis=1) > 15)
-    if ok.sum() < 50:
+    patches = [frame[y : y + h, x : x + w].reshape(-1, 3) for x, y, w, h in rois]
+    px = np.concatenate(patches)
+    ycc = cv2.cvtColor(px.reshape(-1, 1, 3), cv2.COLOR_BGR2YCrCb).reshape(-1, 3).astype(np.int16)
+    med = np.median(ycc, axis=0)
+    ok = (
+        (np.abs(ycc[:, 1] - med[1]) <= 12)
+        & (np.abs(ycc[:, 2] - med[2]) <= 12)
+        & (ycc[:, 0] >= 0.6 * med[0])
+        & (ycc[:, 0] <= 1.5 * med[0])
+        & (px.max(axis=1) < 250)
+        & (px.min(axis=1) > 10)
+    )
+    pxf = px.astype(float)
+    out = [pxf[ok].mean(axis=0)] if ok.sum() >= 100 else None
+    if out is None:
         return None
-    b, g, r = px[ok].mean(axis=0)  # OpenCV liefert BGR
-    return np.array([r, g, b])
+    start = 0
+    for p in patches:
+        m = ok[start : start + len(p)]
+        if m.sum() < 30:
+            return None
+        out.append(pxf[start : start + len(p)][m].mean(axis=0))
+        start += len(p)
+    return np.array(out)[:, ::-1].copy()  # BGR -> RGB
+
+
+def mean_rgb(frame: np.ndarray, rois: list[Rect]) -> np.ndarray | None:
+    """Mittlere RGB-Farbe aller Hautpixel in den Regionen (zusammengefasst)."""
+    c = region_colors(frame, rois)
+    return None if c is None else c[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -228,6 +256,13 @@ def camera_permission_hint() -> str:
     )
 
 
+def clock_cols(wall: float | None) -> list[str]:
+    """Lokale Uhrzeit (HH:MM:SS.mmm) und Unix-Zeit; leer bei Videodateien."""
+    if wall is None:
+        return ["", ""]
+    return [datetime.fromtimestamp(wall).strftime("%H:%M:%S.%f")[:-3], f"{wall:.3f}"]
+
+
 def parse_roi(s: str) -> Rect:
     try:
         x, y, w, h = (int(v) for v in s.split(","))
@@ -246,18 +281,34 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--headless", action="store_true", help="Kein Fenster, nur Textausgabe")
     p.add_argument("--csv", help="Messwerte in diese CSV-Datei schreiben")
     p.add_argument("--no-mirror", action="store_true", help="Live-Bild nicht spiegeln")
+    p.add_argument("--no-track", action="store_true", help="Kein Peak-Tracking (jedes Fenster unabhängig schätzen)")
+    p.add_argument(
+        "--record",
+        help="Rohdaten pro Bild (Zeit, Hautfarben je Region, Gesichtsbox) als CSV speichern – zum Nachanalysieren",
+    )
     args = p.parse_args(argv)
 
     cap = open_capture(args)
     tracker = None if args.roi else FaceTracker()
-    estimator = PulseEstimator(window_sec=args.window, min_sec=min(8.0, args.window), method=args.method)
+    estimator = PulseEstimator(
+        window_sec=args.window, min_sec=min(8.0, args.window), method=args.method, track=not args.no_track
+    )
     mirror = not args.video and not args.no_mirror
     video_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
 
     csv_file = open(args.csv, "w", newline="") if args.csv else None
     writer = csv.writer(csv_file) if csv_file else None
     if writer:
-        writer.writerow(["zeit_s", "bpm", "bpm_roh", "snr_db"])
+        writer.writerow(["uhrzeit", "unix_s", "zeit_s", "bpm", "bpm_roh", "snr_db"])
+
+    rec_file = open(args.record, "w", newline="") if args.record else None
+    rec = csv.writer(rec_file) if rec_file else None
+    if rec:
+        cols = ["uhrzeit", "unix_s", "zeit_s", "bild_hell"]
+        for name in ("alle", "stirn", "wange_l", "wange_r"):
+            cols += [f"{name}_r", f"{name}_g", f"{name}_b"]
+        rec.writerow(cols + ["gesicht_x", "gesicht_y", "gesicht_b", "gesicht_h"])
+        print(f"Zeichne Rohdaten auf: {args.record} (Start {datetime.now():%H:%M:%S})", flush=True)
 
     t_start = time.monotonic()
     last_face_t: float | None = None
@@ -290,12 +341,15 @@ def main(argv: list[str] | None = None) -> int:
             frame_idx += 1
             if args.video:
                 t = frame_idx / video_fps
+                wall = None
             else:
                 t = time.monotonic() - t_start
+                wall = time.time()  # Uhrzeit für den Abgleich mit Referenzgeräten
             if mirror:
                 frame = cv2.flip(frame, 1)
 
             # 1) Hautregionen bestimmen
+            face = None
             if args.roi:
                 rois = [args.roi]
             else:
@@ -303,7 +357,13 @@ def main(argv: list[str] | None = None) -> int:
                 rois = skin_rois(face, frame.shape) if face else []
 
             # 2) Farbe messen
-            rgb = mean_rgb(frame, rois) if rois else None
+            rgb = region_colors(frame, rois) if rois else None
+            if rec:
+                row = [*clock_cols(wall), f"{t:.4f}", f"{frame.mean():.3f}"]
+                vals = [f"{v:.4f}" for v in rgb.ravel()] if rgb is not None else []
+                row += (vals + [""] * 12)[:12]
+                row += [f"{v:.1f}" for v in face.box] if face is not None else [""] * 4
+                rec.writerow(row)
             if rgb is not None:
                 estimator.push(t, rgb)
                 last_face_t = t
@@ -326,7 +386,9 @@ def main(argv: list[str] | None = None) -> int:
                 if new is not None:
                     result = new
                     if writer:
-                        writer.writerow([f"{t:.2f}", f"{new.bpm:.1f}", f"{new.raw_bpm:.1f}", f"{new.snr_db:.2f}"])
+                        writer.writerow(
+                            [*clock_cols(wall), f"{t:.2f}", f"{new.bpm:.1f}", f"{new.raw_bpm:.1f}", f"{new.snr_db:.2f}"]
+                        )
 
             if args.headless and result is not None and t - last_print_t >= 1.0:
                 last_print_t = t
@@ -365,6 +427,9 @@ def main(argv: list[str] | None = None) -> int:
             cv2.destroyAllWindows()
         if csv_file:
             csv_file.close()
+        if rec_file:
+            rec_file.close()
+            print(f"Rohdaten gespeichert: {args.record}")
 
     if result is not None and not np.isnan(result.bpm):
         print(f"Letzter Messwert: {result.bpm:.1f} BPM")

@@ -19,7 +19,7 @@ from collections import deque
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.signal import butter, filtfilt
+from scipy.signal import butter, filtfilt, find_peaks
 
 MIN_BPM = 42.0
 MAX_BPM = 210.0
@@ -95,24 +95,44 @@ def bandpass(x: np.ndarray, fs: float, lo_bpm: float = MIN_BPM, hi_bpm: float = 
     return filtfilt(b, a, x)
 
 
-def spectrum_peak(x: np.ndarray, fs: float) -> tuple[float, float]:
-    """Dominante Frequenz im Pulsband als (bpm, SNR in dB).
-
-    Der SNR folgt de Haan & Jeanne (2013): Leistung in einem schmalen Fenster
-    um die Grundfrequenz und ihre erste Oberwelle im Verhältnis zur restlichen
-    Leistung im Pulsband. Werte > 0 dB deuten auf ein brauchbares Signal hin.
-    """
+def power_spectrum(x: np.ndarray, fs: float) -> tuple[np.ndarray, np.ndarray]:
+    """Leistungsspektrum im Pulsband (Frequenzen in Hz), normiert auf Summe 1."""
     x = x - x.mean()
     n = len(x)
     nfft = 1 << int(np.ceil(np.log2(max(n * 8, 2048))))
     spec = np.abs(np.fft.rfft(x * np.hanning(n), nfft)) ** 2
     freqs = np.fft.rfftfreq(nfft, 1.0 / fs)
-
     band = (freqs >= MIN_BPM / 60.0) & (freqs <= MAX_BPM / 60.0)
-    if not band.any() or spec[band].sum() <= 0:
+    f, s = freqs[band], spec[band]
+    total = s.sum()
+    return f, (s / total if total > 0 else s)
+
+
+TRACK_RATIO = 0.5  # Nebenpeaks ab diesem Anteil des Maximums kommen fürs Tracking in Frage
+
+
+def pick_peak(
+    freqs: np.ndarray, spec: np.ndarray, n: int, fs: float, prev_bpm: float | None = None
+) -> tuple[float, float]:
+    """Herzfrequenz-Peak als (bpm, SNR in dB).
+
+    Ohne prev_bpm gewinnt der stärkste Peak. Mit prev_bpm wird unter allen
+    Peaks, die mindestens TRACK_RATIO des stärksten erreichen, der zum
+    bisherigen Wert nächstgelegene genommen. Das verhindert Springen zwischen
+    zwei ähnlich starken Peaks (z. B. Puls vs. Bewegungs-/Atemartefakt),
+    lässt aber einen deutlich dominanten neuen Peak durch.
+
+    Der SNR folgt de Haan & Jeanne (2013): Leistung um Grundfrequenz und erste
+    Oberwelle im Verhältnis zur restlichen Leistung im Pulsband.
+    """
+    if len(spec) == 0 or spec.sum() <= 0:
         return float("nan"), float("-inf")
-    idx = np.flatnonzero(band)
-    k = idx[np.argmax(spec[idx])]
+    k_max = int(np.argmax(spec))
+    k = k_max
+    if prev_bpm is not None and np.isfinite(prev_bpm):
+        peaks, _ = find_peaks(spec)
+        cands = [int(p) for p in peaks if spec[p] >= TRACK_RATIO * spec[k_max]] + [k_max]
+        k = min(cands, key=lambda p: abs(freqs[p] * 60.0 - prev_bpm))
 
     # Parabolische Interpolation für Auflösung unterhalb des FFT-Rasters
     f_peak = freqs[k]
@@ -125,10 +145,16 @@ def spectrum_peak(x: np.ndarray, fs: float) -> tuple[float, float]:
     # Hauptkeule des Hann-Fensters ist ±2/T breit – so viel gehört zum Peak
     tol = max(0.1, 2.0 * fs / n)  # Hz
     signal_mask = (np.abs(freqs - f_peak) <= tol) | (np.abs(freqs - 2 * f_peak) <= 2 * tol)
-    sig = spec[band & signal_mask].sum()
-    noise = spec[band & ~signal_mask].sum()
+    sig = spec[signal_mask].sum()
+    noise = spec[~signal_mask].sum()
     snr = 10 * np.log10(sig / noise) if noise > 0 else float("inf")
     return float(f_peak * 60.0), float(snr)
+
+
+def spectrum_peak(x: np.ndarray, fs: float) -> tuple[float, float]:
+    """Stärkster Peak eines einzelnen Signals als (bpm, SNR in dB)."""
+    f, s = power_spectrum(x, fs)
+    return pick_peak(f, s, len(x), fs)
 
 
 @dataclass
@@ -136,12 +162,17 @@ class PulseResult:
     bpm: float  # geglätteter Wert für die Anzeige
     raw_bpm: float  # Schätzung nur aus dem aktuellen Fenster
     snr_db: float
-    signal: np.ndarray  # gefiltertes Pulssignal (für die Kurve)
+    signal: np.ndarray  # gefiltertes Pulssignal der besten Region (für die Kurve)
     fs: float
 
 
 class PulseEstimator:
     """Sammelt RGB-Samples und schätzt fortlaufend die Herzfrequenz.
+
+    Pro Sample können mehrere Hautregionen übergeben werden (Array (k, 3)).
+    Jede Region liefert ein eigenes Pulssignal; die Spektren werden nach ihrer
+    Schärfe gewichtet kombiniert. So verdirbt eine gestörte Region (Haare,
+    Schatten, Bewegung am Rand) nicht das Gesamtergebnis.
 
     window_sec: Länge des Analysefensters. Länger = stabiler, aber träger.
     min_sec:    Mindestdauer, bevor die erste Schätzung ausgegeben wird.
@@ -154,8 +185,9 @@ class PulseEstimator:
         min_sec: float = 8.0,
         fs: float = 30.0,
         min_snr_db: float = -3.0,
-        smoothing: int = 7,
+        smoothing: int = 9,
         method: str = "pos",
+        track: bool = True,
     ) -> None:
         if method not in METHODS:
             raise ValueError(f"Unbekannte Methode {method!r}, erlaubt: {', '.join(METHODS)}")
@@ -164,6 +196,7 @@ class PulseEstimator:
         self.min_sec = min_sec
         self.fs = fs
         self.min_snr_db = min_snr_db
+        self.track = track
         self._t: deque[float] = deque()
         self._rgb: deque[np.ndarray] = deque()
         self._history: deque[float] = deque(maxlen=smoothing)
@@ -178,11 +211,14 @@ class PulseEstimator:
         return self._t[-1] - self._t[0] if len(self._t) > 1 else 0.0
 
     def push(self, t: float, rgb) -> None:
-        """Fügt ein Sample hinzu: Zeitstempel in Sekunden, mittleres (R, G, B)."""
+        """Fügt ein Sample hinzu: Zeitstempel in Sekunden, (R, G, B) oder (k, 3)."""
+        c = np.atleast_2d(np.asarray(rgb, dtype=float))
+        if self._rgb and self._rgb[-1].shape != c.shape:
+            self.reset()  # Anzahl Regionen hat sich geändert
         if self._t and t <= self._t[-1]:
             return  # doppelte/rückwärtslaufende Zeitstempel ignorieren
         self._t.append(float(t))
-        self._rgb.append(np.asarray(rgb, dtype=float))
+        self._rgb.append(c)
         while self._t and self._t[-1] - self._t[0] > self.window_sec:
             self._t.popleft()
             self._rgb.popleft()
@@ -190,14 +226,33 @@ class PulseEstimator:
     def estimate(self) -> PulseResult | None:
         if self.buffered_sec < self.min_sec:
             return None
-        _, rgb = resample_uniform(np.array(self._t), np.vstack(self._rgb), self.fs)
-        if len(rgb) < int(2 * self.fs):
+        stack = np.stack(self._rgb)  # (N, k, 3)
+        n_raw, k, _ = stack.shape
+        _, flat = resample_uniform(np.array(self._t), stack.reshape(n_raw, k * 3), self.fs)
+        n = len(flat)
+        if n < int(2 * self.fs):
             return None
-        sig = bandpass(self._extract(rgb, self.fs), self.fs)
-        raw_bpm, snr = spectrum_peak(sig, self.fs)
+        regions = flat.reshape(n, k, 3)
+
+        combined = None
+        best_q, best_sig = -1.0, None
+        freqs = None
+        for i in range(k):
+            sig = bandpass(self._extract(regions[:, i], self.fs), self.fs)
+            freqs, spec = power_spectrum(sig, self.fs)
+            q = float(spec.max()) if len(spec) else 0.0  # Schärfe des Spektrums
+            combined = q**2 * spec if combined is None else combined + q**2 * spec
+            if q > best_q:
+                best_q, best_sig = q, sig
+        if combined is None or combined.sum() <= 0:
+            return None
+        combined = combined / combined.sum()
+
+        prev = float(np.median(self._history)) if (self.track and self._history) else None
+        raw_bpm, snr = pick_peak(freqs, combined, n, self.fs, prev)
         if np.isnan(raw_bpm):
             return None
         if snr >= self.min_snr_db:
             self._history.append(raw_bpm)
         smoothed = float(np.median(self._history)) if self._history else float("nan")
-        return PulseResult(bpm=smoothed, raw_bpm=raw_bpm, snr_db=snr, signal=sig, fs=self.fs)
+        return PulseResult(bpm=smoothed, raw_bpm=raw_bpm, snr_db=snr, signal=best_sig, fs=self.fs)
